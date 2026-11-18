@@ -1,0 +1,7 @@
+# CIFAR-10 데이터셋은 용량이 커서 GitHub에 올리지 않습니다.
+cifar-10-python.tar.gz
+cifar-10-batches-py/
+__pycache__/
+*.pyc
+.venv/
+.vscode/

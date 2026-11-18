@@ -1,0 +1,20 @@
+이 폴더의 현재 파일:
+- random_weights.png : seed=42, std=0.01로 생성한 실제 무작위 W 가중치 시각화
+- ppt_formula_self_test.txt : 수업 PPT의 3개 SVM 예제와 Softmax 수치검증 결과
+
+주의: 위 검증값은 CIFAR-10 이미지의 예측값이 아닙니다.
+현재 CIFAR-10 원본 데이터가 제공되지 않아 실제 이미지의 점수/Loss는 포함하지 않았습니다.
+
+CIFAR-10 데이터를 같은 폴더에 넣고 아래 명령을 실행하면 과제 제출 결과가 추가 생성됩니다.
+    python linear_classification.py --data cifar-10-python.tar.gz
+또는
+    python linear_classification.py --download
+
+생성되는 파일:
+- score_probabilities.csv
+- svm_loss_and_probability_sums.csv
+- selected_examples.png
+- correct_incorrect.png
+- score_vs_softmax.png
+- random_weights.png (재생성)
+- brief_explanations_ko.md

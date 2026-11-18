@@ -1,0 +1,11 @@
+﻿example_no,test_index,true_label,predicted_label,correct,svm_hinge_loss,softmax_probability_sum
+1,885,airplane,dog,False,14.64257144,1.000000000000
+2,7862,automobile,frog,False,7.50093651,1.000000000000
+3,6533,bird,horse,False,9.06071156,1.000000000000
+4,4520,cat,frog,False,15.03843838,1.000000000000
+5,4262,deer,frog,False,11.15320718,1.000000000000
+6,8458,dog,frog,False,5.22443000,1.000000000000
+7,746,frog,frog,True,3.62920186,1.000000000000
+8,6955,horse,frog,False,5.68972793,1.000000000000
+9,1866,ship,dog,False,4.24268946,1.000000000000
+10,851,truck,frog,False,12.91020182,1.000000000000
