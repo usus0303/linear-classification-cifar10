@@ -1,13 +1,27 @@
-"""CIFAR-10 선형 분류기 과제 (학습 없이 무작위 가중치 사용).
+"""CIFAR-10 선형 분류 실습: 연산 순서를 따라 읽는 한국어 주석판.
 
-참고: Week 9-2 Linear Classification 강의자료
-실행 예시:
-    pip install -r requirements.txt
-    python linear_classification.py --data cifar-10-python.tar.gz
-    python linear_classification.py --download
-    python linear_classification.py --self-test
+읽는 순서: 맨 위 main()에서 실행 흐름을 보고, 그 아래 함수들을 단계별로 읽기.
+핵심 함수: preprocess_images → initialize_parameters → compute_scores →
+          predict_classes → compute_svm_loss → compute_softmax.
 
-이 프로그램은 가중치의 업데이트, 최적화, 모델 학습을 수행하지 않습니다.
+실행 흐름:
+    test_batch 불러오기: (10000,3072)
+      → 클래스별 1장 선택: (10,3072)
+      → X=픽셀/255: (10,3072)
+      → W(10,3072), b(10,) 초기화: 이미지와 독립적으로 생성
+      → scores=X@W.T+b: (10,10)
+      → argmax로 예측: (10,)
+      ├→ SVM: 정답 제외 나머지 9개 클래스와 비교, 이미지별 합 → 전체 평균
+      └→ Softmax: 같은 원본 scores를 확률로 변환, 각 이미지의 10개 합은 1
+      → 원본/예측 및 W를 시각화 (W 업데이트 없음)
+
+대표 숫자(사용자가 실행한 seed=42, 10장 설정):
+    첫 이미지 Test #885: true=airplane, pred=dog
+    scores[0,0]=-0.353013, scores[0,5]=0.867669
+    SVM 평균=8.909212, Softmax 확률의 합=1.
+
+사용법: python linear_classification.py --data "cifar-10-batches-py"
+        python linear_classification.py --self-test
 """
 
 from __future__ import annotations
@@ -42,6 +56,135 @@ CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
 
 
 # -----------------------------------------------------------------------------
+# START HERE: main()의 1~10단계를 먼저 읽으면 데이터가 어떻게 계산되는지 보인다.
+# 각 단계의 내부 연산은 아래에 순서대로 정의된 함수에서 확인한다.
+# -----------------------------------------------------------------------------
+def main() -> None:
+    """전체 실험의 실제 실행 순서표. 발표 때는 이 함수부터 보면 된다.
+
+    함수 호출의 흐름:
+      데이터 불러오기 → 클래스별 1장 선택 → 0~1 정규화 → W,b 생성
+        → Wx+b 점수 계산 → 최고 점수 예측
+        ├─ SVM Loss 계산 (정답과 나머지 9개 클래스 비교)
+        └─ Softmax 계산 (원본 점수 10개를 확률로 변환)
+      → 정답/오답 비교 → 클래스별 W 패턴 시각화 → 결과 저장
+
+    SVM Loss를 Softmax에 입력하지 않는다. 두 계산 모두 'scores'를 사용한다.
+    과제 조건상 W는 절대로 업데이트하지 않는다.
+    """
+    parser = argparse.ArgumentParser(description="CIFAR-10 Linear Classification (no training)")
+    parser.add_argument(
+        "--data", type=Path, default=Path("cifar-10-python.tar.gz"),
+        help="CIFAR-10 Python tar.gz 파일 또는 압축 해제된 폴더 경로",
+    )
+    parser.add_argument("--download", action="store_true", help="데이터가 없다면 공식 사이트에서 다운로드")
+    parser.add_argument("--num-examples", type=int, default=10, help="분석할 이미지 수 (기본 10장)")
+    parser.add_argument("--seed", type=int, default=42, help="이미지 선택 및 W 초기화 시드")
+    parser.add_argument("--weight-std", type=float, default=0.01, help="W 초기화 정규분포 표준편차")
+    parser.add_argument("--search-size", type=int, default=1000, help="정답/오답 추가 사례 검색 수")
+    parser.add_argument("--output-dir", type=Path, default=Path("results"), help="결과 저장 폴더")
+    parser.add_argument("--self-test", action="store_true", help="PPT 수식 검증 (데이터 필요 없음)")
+    args = parser.parse_args()
+
+    if args.self_test:
+        print(run_formula_self_test())
+        return
+
+    # ===== 1. CIFAR-10 test_batch 로딩 =========================================
+    # 공식 파일을 그대로 읽는다. 'data_batch_1~5'를 학습에 사용하지 않는다.
+    if args.download and not args.data.exists():
+        if args.data.suffixes[-2:] != [".tar", ".gz"]:
+            parser.error("--download 사용 시 --data에는 .tar.gz 파일 경로를 지정해 주세요.")
+        download_cifar10(args.data)
+    raw_images, labels = load_cifar10(args.data)
+    # raw_images: (10000,3072), labels: (10000,), 픽셀값은 아직 0~255
+    print(f"[1] 데이터 로딩 완료: images={raw_images.shape}, labels={labels.shape}")
+
+    # ===== 2. 이미지 10장 선택 =================================================
+    # 클래스 0~9에서 각각 1장씩 무작위 선택 (seed 고정) → (10,3072)
+    selected_images, selected_labels, selected_indices = select_examples(
+        raw_images, labels, args.num_examples, args.seed
+    )
+
+    # ===== 3. 픽셀 3072개를 각각 255로 나누어 정규화 ============================
+    # X[i,p] = selected_images[i,p] / 255.0 → X: (10,3072), 값의 범위 0~1
+    X = preprocess_images(selected_images)
+    print(f"[2] 예시 {len(X)}장, 정규화된 입력 X={X.shape}")
+
+    # ===== 4. 클래스별 무작위 W와 b=0 생성 ====================================
+    # W[클래스,픽셀]: (10,3072). 클래스마다 다르지만 모든 이미지에 공통 적용.
+    W, b = initialize_parameters(args.seed, args.weight_std)
+
+    # ===== 5. 각 이미지에 대해 10개 클래스 점수 계산 ===========================
+    # scores[i,j] = Σ_p X[i,p]*W[j,p] + b[j] → scores: (10,10)
+    scores = compute_scores(X, W, b)
+
+    # ===== 6. 이미지별 최고 점수의 클래스 번호 선택 ============================
+    # predictions[i] = argmax(scores[i,:]) → (10,)
+    predictions = predict_classes(scores)
+    print(f"[3] 가중치 W={W.shape}, 편향 b={b.shape}, 점수={scores.shape}")
+
+    # ===== 7. SVM Hinge Loss: 정답과 다른 9개 클래스 점수 비교 =================
+    # 이미지별 9개 비교 손실을 더한 값: losses_per_image (10,)
+    # 그 10개의 손실을 다시 평균: average_loss (스칼라), W는 변경하지 않음.
+    losses_per_image, average_loss = compute_svm_loss(scores, selected_labels)
+    print(f"[4] Multiclass SVM 평균 Hinge Loss: {average_loss:.6f}")
+
+    # ===== 8. Softmax: SVM Loss가 아니라 원본 scores를 확률로 변환 =============
+    # probabilities[i,j] = exp(scores[i,j]) / Σ_k exp(scores[i,k])
+    # → probabilities: (10,10), 각 행의 확률 합이 1.
+    probabilities = compute_softmax(scores)
+    probability_sums, probability_valid = verify_probabilities(probabilities)
+    if not probability_valid:
+        raise AssertionError("Softmax 확률 합이 1이 아닙니다. 코드를 확인해 주세요.")
+    if not np.array_equal(predictions, predict_classes(probabilities)):
+        raise AssertionError("Softmax 처리로 예측 클래스가 달라졌습니다.")
+    print(f"[5] Softmax 확률 합 검사: {probability_valid}")
+
+    # ===== 9. 별도 탐색 이미지에서 정답/오답 사례를 하나씩 확인 ===================
+    # 똑같은 W를 test_batch 앞 1000장에도 적용해 예측과 정답을 비교한다.
+    cases = find_correct_incorrect_examples(raw_images, labels, W, b, args.search_size)
+    print("[6] 정답 및 오답 사례 탐색 완료")
+
+    # ===== 10. 위에서 계산을 마친 숫자/이미지를 파일로 정리 ====================
+    # 아래 함수들은 *계산 결과를 보여주거나 저장*하는 보조 함수들이다.
+    # 손실이나 Softmax의 핵심 연산은 이미 5~8단계에서 끝났다.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_score_results(
+        selected_indices, selected_labels, predictions, scores, probabilities,
+        args.output_dir / "score_probabilities.csv",
+    )
+    save_loss_results(
+        selected_indices, selected_labels, predictions, losses_per_image,
+        probability_sums, args.output_dir / "svm_loss_and_probability_sums.csv",
+    )
+    visualize_predictions(
+        selected_images, selected_labels, predictions, selected_indices,
+        args.output_dir / "selected_examples.png",
+    )
+    visualize_correct_incorrect(cases, args.output_dir / "correct_incorrect.png")
+    visualize_weights(W, args.output_dir / "random_weights.png")
+    visualize_score_softmax_comparison(
+        scores[0], probabilities[0], args.output_dir / "score_vs_softmax.png",
+    )
+    save_explanations(
+        args.output_dir / "brief_explanations_ko.md",
+        args.seed, args.weight_std, selected_indices, selected_labels, predictions,
+        scores, probabilities, losses_per_image, average_loss,
+        probability_sums, probability_valid, cases,
+    )
+    print_detailed_scores(
+        selected_indices, selected_labels, predictions, scores, probabilities,
+        losses_per_image, probability_sums,
+    )
+    print("\n" + "=" * 72)
+    print(f"평균 SVM Hinge Loss: {average_loss:.6f}")
+    print("Softmax 확률 합 모두 1:", probability_valid)
+    print(f"[7] 제출용 파일 저장 완료: {args.output_dir.resolve()}")
+    print("※ 학습/정확도/정밀도/재현율/F1 계산은 수행하지 않았습니다.")
+
+
+# -----------------------------------------------------------------------------
 # 1. 데이터 불러오기 / 전처리
 # -----------------------------------------------------------------------------
 def download_cifar10(destination: Path) -> None:
@@ -70,61 +213,52 @@ def download_cifar10(destination: Path) -> None:
 
 
 def load_cifar10(dataset_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """CIFAR-10의 test_batch만 불러옵니다. **학습 데이터는 사용하지 않습니다.**
+    """[1단계] test_batch를 읽어 원본 픽셀(아직 0~255)과 정답 번호를 얻는다.
 
-    Args:
-        dataset_path:
-            1) 공식 파일 cifar-10-python.tar.gz 또는
-            2) 압축을 푼 cifar-10-batches-py 폴더 또는 그 상위 폴더.
+    입력: CIFAR-10 tar.gz 파일 또는 압축 해제된 cifar-10-batches-py 폴더
+    출력: images (10000, 3072), labels (10000,)
 
-    Returns:
-        images: (10000, 3072) 형태의 uint8 배열. RGB 채널별로 펼쳐진 픽셀 값.
-        labels: (10000,) 형태의 정답 번호(0~9).
-
-    주의:
-        공식 CIFAR-10 Python 데이터는 pickle 파일입니다. 신뢰할 수 있는
-        공식 배포본만 불러오세요. 출처를 알 수 없는 pickle은 사용하지 마세요.
+    핵심: 파일에서 데이터를 읽는 것이지 모델에 데이터를 학습시키는 것이 아니다.
+    CIFAR-10 Python 데이터는 pickle이므로 신뢰할 수 있는 공식 배포본만 연다.
     """
     dataset_path = Path(dataset_path)
 
+    # [1-1] 경로가 압축 파일이면 압축을 풀지 않고 그 안의 'test_batch'를 찾는다.
     if dataset_path.is_file():
-        # 압축을 풀지 않아도 tar.gz 내부의 test_batch 파일을 직접 읽습니다.
         with tarfile.open(dataset_path, mode="r:gz") as archive:
-            target = "cifar-10-batches-py/test_batch"
-            member = archive.extractfile(target)
+            member = archive.extractfile("cifar-10-batches-py/test_batch")
             if member is None:
-                raise FileNotFoundError(f"압축 파일에서 '{target}'를 찾을 수 없습니다.")
+                raise FileNotFoundError("압축 파일 안에 test_batch가 없습니다.")
             batch = pickle.load(member, encoding="bytes")
 
+    # [1-2] 경로가 폴더이면 해당 폴더 또는 하위 폴더의 'test_batch'를 연다.
     elif dataset_path.is_dir():
-        # 압축을 미리 풀어둔 경우에는 해당 폴더에서도 읽을 수 있습니다.
         candidates = [
             dataset_path / "test_batch",
             dataset_path / "cifar-10-batches-py" / "test_batch",
         ]
-        test_file = next((path for path in candidates if path.is_file()), None)
+        test_file = next((item for item in candidates if item.is_file()), None)
         if test_file is None:
-            raise FileNotFoundError(
-                f"{dataset_path} 안에 test_batch가 없습니다. "
-                "cifar-10-batches-py 폴더를 지정해 주세요."
-            )
+            raise FileNotFoundError(f"{dataset_path}에서 test_batch를 찾지 못했습니다.")
         with test_file.open("rb") as f:
             batch = pickle.load(f, encoding="bytes")
     else:
-        raise FileNotFoundError(
-            f"데이터 파일을 찾을 수 없습니다: {dataset_path}\n"
-            "공식 압축 파일을 코드와 같은 폴더에 두거나 --download 옵션을 사용하세요."
-        )
+        raise FileNotFoundError(f"데이터 파일/폴더가 없습니다: {dataset_path}")
 
-    # CIFAR-10 Python 배포본의 key는 bytes 타입일 수 있습니다.
+    # [1-3] batch[b'data']: 이미지 10000장의 RGB 픽셀 3072개를 담고 있다.
+    #       현재 픽셀값은 0~255 정수이다. 아직 정규화하거나 점수를 구하지 않았다.
     images = np.asarray(batch[b"data"], dtype=np.uint8)
+
+    # [1-4] batch[b'labels']: 각 이미지의 정답 클래스 번호(0~9)이다.
+    #       예: 0=airplane, 3=cat, 8=ship (CLASS_NAMES 순서와 일치)
     labels = np.asarray(batch[b"labels"], dtype=np.int64)
 
-    # 모양을 확인하면 파일을 잘못 불러오는 실수를 빠르게 찾을 수 있습니다.
+    # [1-5] 각 행에는 이미지 1장의 3072개 픽셀이 있어야 한다.
     if images.ndim != 2 or images.shape[1] != INPUT_DIM:
         raise ValueError(f"이미지 모양이 예상과 다릅니다: {images.shape}")
     if labels.shape != (len(images),):
         raise ValueError(f"정답 배열 모양이 예상과 다릅니다: {labels.shape}")
+
     return images, labels
 
 
@@ -134,67 +268,84 @@ def select_examples(
     num_examples: int,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """10개 클래스가 고르게 포함되도록 예시 이미지를 고정 시드로 뽑습니다.
+    """[2단계] 각 클래스에서 이미지를 뽑는다(기본 10장 = 클래스별 1장).
 
-    예: 10장 선택 -> 클래스 0~9에서 각각 한 장씩 무작위 선택.
-    예: 20장 선택 -> 각 클래스에서 두 장씩 선택.
+    단순히 전체 데이터에서 임의의 10장을 뽑는 방식이 아니다.
+    기본 설정에서는 airplane~truck의 10개 클래스마다 1장씩 무작위로 선정한다.
+    결과의 이미지 행 순서는 클래스 0~9 순서이며, 각 행은 (3072,)이다.
 
-    클래스별 샘플을 고르게 선정하는 것은 '시각화용 예시 선택'이며,
-    가중치 학습이나 좋은 예측을 유도하는 절차가 아닙니다.
-
-    Returns:
-        selected_images: (N, 3072) 원본 픽셀
-        selected_labels: (N,) 실제 정답
-        selected_indices: (N,) 원본 test_batch에서의 이미지 인덱스
+    출력: 선택한 픽셀 (N, 3072), 정답 (N,), 원본 test_batch 인덱스 (N,)
     """
     if not 1 <= num_examples <= len(images):
         raise ValueError("num_examples는 1 이상이며 데이터 수 이하이어야 합니다.")
 
+    # [2-1] 같은 seed를 쓰면 같은 이미지의 인덱스를 선택할 수 있다.
+    #       아래 W 초기화 함수 역시 seed=42를 사용하지만 별도의 난수 생성기이다.
     rng = np.random.default_rng(seed)
     chosen_indices = []
 
-    # 10장 미만이면 앞의 일부 클래스만 포함되는 방식입니다.
-    # 10장 이상이면 정확히 10개 클래스가 한 번씩 포함됩니다.
+    # [2-2] 기본 num_examples=10 → [0,1,2,...,9] 클래스 각각 1개.
+    #       예를 들어 num_examples=20 → 각 클래스 2장씩 선택한다.
     wanted_labels = np.arange(num_examples) % NUM_CLASSES
     for class_id in range(NUM_CLASSES):
         count = int(np.sum(wanted_labels == class_id))
         if count == 0:
             continue
+
+        # [2-3] 지금 순회 중인 클래스의 원본 데이터 인덱스를 모은다.
+        #       예: class_id=3 → 고양이 이미지만 후보로 추림.
         available_indices = np.flatnonzero(labels == class_id)
         if count > len(available_indices):
             raise ValueError(f"{CLASS_NAMES[class_id]} 클래스의 샘플 수가 부족합니다.")
+
+        # [2-4] 그 클래스의 후보 중 필요한 수만큼 무작위 선택한다.
+        #       replace=False: 동일 이미지를 중복 선택하지 않는다.
         sampled_indices = rng.choice(available_indices, size=count, replace=False)
         chosen_indices.extend(sampled_indices.tolist())
 
-    # 클래스 순서대로 결과를 볼 수 있도록 정답 번호로 정렬합니다.
+    # [2-5] 발표와 출력 표를 읽기 쉽도록 정답 클래스 번호 순으로 정렬한다.
     chosen_indices = np.asarray(chosen_indices, dtype=np.int64)
     chosen_indices = chosen_indices[np.argsort(labels[chosen_indices], kind="stable")]
+
+    # 이미지의 픽셀과 정답, 원본 test_batch 인덱스를 나란히 반환한다.
     return images[chosen_indices], labels[chosen_indices], chosen_indices
 
 
 def preprocess_images(images: np.ndarray) -> np.ndarray:
-    """픽셀을 0~1 범위로 정규화하여 (N, 3072) 실수 배열로 바꿉니다.
+    """[3단계] N장의 3072개 픽셀값을 0~255에서 0~1 사이로 변경한다.
 
-    원본 픽셀 값: 0~255 -> 정규화한 값: 0.0~1.0
-    CIFAR-10의 저장 형태는 이미 (N, 3072)로 펼쳐져 있습니다.
-    원래 이미지가 (N, 32, 32, 3)이라면 채널별 순서에 맞게 펼쳐야 합니다.
+    계산: x_normalized = x_original / 255.0
+    예: 픽셀 0→0.0, 128→약 0.502, 255→1.0
+    출력: (N,3072) 모양의 실수형 X (입력의 이미지 순서 그대로)
 
-    주의: 여기서는 간단한 입력값 스케일 조정만 수행합니다.
-    데이터 통계로 모델을 학습하거나 가중치를 변경하지 않습니다.
+    참고: CIFAR-10 Python 파일은 이미 (N,3072)로 저장되므로 여기서는
+    32×32×3을 다시 펼치는 연산이 필요 없다. 계산하는 동안 RGB 순서는 유지된다.
     """
     if images.ndim != 2 or images.shape[1] != INPUT_DIM:
         raise ValueError(f"예상 입력 크기: (N, {INPUT_DIM}), 실제: {images.shape}")
-    return images.astype(np.float64) / 255.0
+
+    # [3-1] 소수점 계산을 위해 정수(uint8) 픽셀을 실수(float64)로 변환한다.
+    images_as_float = images.astype(np.float64)
+
+    # [3-2] 픽셀값 하나하나를 255로 나눠 선형 분류기에 입력할 X를 만든다.
+    #       N=10이라면 X.shape=(10,3072). 이미지당 3072개의 특징은 그대로다.
+    X = images_as_float / 255.0
+    return X
 
 
 def flat_to_rgb_image(flat_image: np.ndarray) -> np.ndarray:
-    """CIFAR-10의 3072개 픽셀을 사람이 보는 RGB 이미지로 복원합니다.
+    """그림을 표시할 때만 3072차원 1개 벡터를 32×32×3 RGB로 복원한다.
 
-    공식 CIFAR-10 파일은 R 1024개, G 1024개, B 1024개 순서로 저장합니다.
-    따라서 (3, 32, 32)로 만들고 채널을 마지막 축으로 옮겨야 합니다.
-    일반적인 reshape(32, 32, 3)만 하면 채널 순서가 뒤섞입니다.
+    CIFAR-10 파일은 R 채널 1024개 + G 채널 1024개 + B 채널 1024개 순서이다.
+    따라서 그냥 reshape(32,32,3)하면 RGB 위치가 뒤섞인다.
+    분류 계산용 X나 W 값은 변경하지 않고 '보여주는 모양'만 변환한다.
     """
-    return flat_image.reshape(3, IMAGE_HEIGHT, IMAGE_WIDTH).transpose(1, 2, 0)
+    # 3072 → (3,32,32): 첫 1024개를 R, 다음 1024개를 G, 마지막을 B로 놓는다.
+    channel_first = flat_image.reshape(IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH)
+
+    # (3,32,32) → (32,32,3): matplotlib이 기대하는 (높이,너비,RGB) 순서.
+    rgb_image = channel_first.transpose(1, 2, 0)
+    return rgb_image
 
 
 # -----------------------------------------------------------------------------
@@ -204,46 +355,68 @@ def initialize_parameters(
     seed: int = 42,
     weight_std: float = 0.01,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """학습 전 상태를 만들기 위해 작은 무작위 가중치와 0 편향을 생성합니다.
+    """[4단계] 학습되지 않은 가중치 W(10,3072)와 편향 b(10,)를 만든다.
 
-    W: (10, 3072) -> 각 행은 해당 클래스의 3072개 픽셀 가중치
-    b: (10,)      -> 각 클래스별 편향 하나
+    - W의 행 0: airplane 점수용 가중치 3072개
+    - W의 행 3: cat 점수용 가중치 3072개
+    - W의 행 9: truck 점수용 가중치 3072개
 
-    같은 seed를 사용하면 같은 W와 b를 얻으므로 결과를 재현할 수 있습니다.
+    각 클래스는 서로 다른 무작위 가중치를 갖는다. 단, 이미지마다 새로운 W를
+    생성하는 것이 아니라, 여기서 한 번 만든 '동일한 W'를 모든 이미지에 쓴다.
     """
     if weight_std <= 0:
         raise ValueError("weight_std는 0보다 커야 합니다.")
+
+    # [4-1] seed=42 고정 → 다시 실행해도 똑같은 무작위 수를 생성한다.
     rng = np.random.default_rng(seed)
+
+    # [4-2] 평균 0, 표준편차 0.01인 정규분포에서 10×3072개 숫자를 생성한다.
+    #       W[class_id, pixel_id]가 '특정 클래스'와 '특정 픽셀'의 가중치이다.
+    #       여기에는 정답/이미지 정보가 쓰이지 않는다 → 무작위 초기화만 수행.
     W = rng.normal(loc=0.0, scale=weight_std, size=(NUM_CLASSES, INPUT_DIM))
+
+    # [4-3] b[class_id]는 클래스별 상수 항이다. 과제 조건에 따라 전부 0으로 설정.
     b = np.zeros(NUM_CLASSES, dtype=np.float64)
     return W, b
 
 
 def compute_scores(X: np.ndarray, W: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """선형 분류기의 핵심 함수 f(x) = Wx + b를 계산합니다.
+    """[5단계] 각 이미지 x에 같은 W, b를 적용해 클래스별 점수 10개를 계산한다.
 
-    단일 이미지의 수식:
-        W(10, 3072) @ x(3072,) + b(10,) -> score(10,)
+    이미지 1장: x(3072,) → W(10,3072) @ x(3072,) + b(10,) → 점수(10,)
+    이미지 N장: X(N,3072) @ W.T(3072,10) + b(10,) → scores(N,10)
 
-    여러 이미지의 NumPy 벡터화 계산:
-        X(N, 3072) @ W.T(3072, 10) + b(10,) -> scores(N, 10)
-
-    점수(score)는 확률이 아닙니다. 음수일 수도 있고 합이 1일 필요도 없습니다.
+    예: scores[0,5]는 '첫 번째 이미지에 대한 dog 클래스 점수'이다.
+    이 점수는 아직 확률이 아니고 음수가 나올 수도 있다.
     """
     if X.ndim != 2 or X.shape[1] != INPUT_DIM:
         raise ValueError("X는 (N, 3072) 형태여야 합니다.")
     if W.shape != (NUM_CLASSES, INPUT_DIM) or b.shape != (NUM_CLASSES,):
         raise ValueError("W는 (10, 3072), b는 (10,) 형태여야 합니다.")
-    return X @ W.T + b
+
+    # [5-1] X의 행 i = i번째 이미지 3072개 픽셀.
+    #       W의 행 j = j번째 클래스가 픽셀 3072개에 부여하는 가중치.
+    #       scores[i,j] = Σ_(pixel=0..3071) X[i,pixel]*W[j,pixel] + b[j]
+    #
+    #       단일 이미지의 수식은 f(x)=Wx+b이지만, 여러 이미지를 행으로 쌓은
+    #       X의 차원은 (N,3072)이므로 파이썬에서는 W를 전치한 W.T를 곱한다.
+    #       이 한 줄이 모든 이미지×모든 클래스의 '내적'을 동시에 수행한다.
+    scores = X @ W.T + b
+
+    # [5-2] 이미지 10장 → 10×10 점수 행렬. W는 변경되지 않는다.
+    return scores
 
 
 def predict_classes(scores: np.ndarray) -> np.ndarray:
-    """각 이미지에서 가장 점수가 높은 클래스의 인덱스를 반환합니다.
+    """[6단계] 이미지마다 최고 점수를 받은 클래스의 번호(0~9)를 선택한다.
 
-    예: scores = [0.2, -0.4, 0.8, ...] -> 가장 큰 0.8의 위치를 예측
-    argmax(axis=1)는 이미지별(행별) 최고 점수의 열 번호를 반환합니다.
+    scores의 한 행: [airplane점수, automobile점수, ..., truck점수]
+    argmax(axis=1): 각 '이미지 행'에서 가장 큰 점수가 있는 '클래스 열'의 번호
+    숫자 예측값은 CLASS_NAMES[번호]로 사람이 읽는 클래스 이름으로 바꿀 수 있다.
     """
-    return np.argmax(scores, axis=1)
+    # 예: 첫 이미지의 최대 점수가 scores[0,5]면 predictions[0]=5 → dog.
+    predictions = np.argmax(scores, axis=1)
+    return predictions
 
 
 # -----------------------------------------------------------------------------
@@ -254,24 +427,20 @@ def compute_svm_loss(
     true_labels: np.ndarray,
     delta: float = 1.0,
 ) -> tuple[np.ndarray, float]:
-    """PPT에서 배운 Multiclass SVM Hinge Loss를 계산합니다.
+    """[7단계] 정답 점수를 다른 9개 클래스 점수와 비교해 SVM 손실을 계산한다.
 
-    이미지 i의 손실:
-        L_i = sum_{j != y_i} max(0, s_j - s_y + delta)
+    수식 (강의 Week 9-2): L_i = Σ_(j≠y_i) max(0, s_ij - s_i,y_i + 1)
+       s_i,y_i = 이미지 i의 '정답 클래스 점수',  s_ij = 이미지 i의 '비교 클래스 점수'
 
-    모든 예시의 평균 손실:
-        L = (L_1 + ... + L_N) / N
+    10개 클래스 중 정답 1개는 합산 대상에서 제외 → 이미지당 9개 비교.
+    이미지 1장 손실 = 9개 비교 손실의 합 (9로 평균 내지 않음).
+    전체 평균 손실 = N장 각각의 손실값을 더한 다음 N으로 나눈 값.
 
-    용어:
-        s_y   : 정답 클래스의 점수
-        s_j   : 비교 대상 클래스의 점수
-        delta : 클래스 간 확보하려는 마진 (강의자료처럼 1 사용)
+    실제 첫 번째 예시: airplane 점수 -0.353013, dog 점수 0.867669
+      dog와 비교한 손실 = max(0, 0.867669 - (-0.353013) + 1) = 2.220682
+    모든 비교 항목을 합하면 약 14.642571. 정답이어도 margin 1 미만이면 Loss>0.
 
-    중요한 점:
-        1) 정답 클래스 자체는 합산에서 제외합니다.
-        2) 음수 마진은 0으로 처리합니다.
-        3) 정답 예측이라고 해서 반드시 손실이 0인 것은 아닙니다.
-           정답 점수가 다른 점수보다 delta 이상 높아야 손실이 0입니다.
+    이 함수는 '얼마나 잘못 점수를 매겼는가'만 측정하며, W는 수정하지 않는다.
     """
     n = scores.shape[0]
     if n == 0 or scores.shape != (n, NUM_CLASSES):
@@ -281,54 +450,68 @@ def compute_svm_loss(
     if delta <= 0:
         raise ValueError("delta는 0보다 커야 합니다.")
 
-    # 각 이미지의 정답 클래스 점수를 추출합니다. (N,) -> (N, 1)
+    # [7-1] 이미지 i마다 정답 클래스 번호 y_i를 이용해 '정답의 점수'를 뽑는다.
+    #       예: 첫 이미지의 정답=airplane(번호 0) → scores[0,0]=-0.353013.
+    #       결과 모양 (N,)을 (N,1)로 바꾸면 각 이미지의 10개 점수에서
+    #       해당 이미지의 정답 점수를 한꺼번에 뺄 수 있다(브로드캐스팅).
     correct_class_scores = scores[np.arange(n), true_labels][:, np.newaxis]
 
-    # s_j - s_y + delta, 결과가 음수이면 0으로 바꿉니다.
+    # [7-2] 각 이미지의 10개 후보 점수에 대해 s_j - s_y + margin(=1) 계산.
+    #       max(0,...)으로 음수는 0 처리, 양수만 손실로 남긴다.
+    #       예: dog와의 비교 = max(0,0.867669 - (-0.353013) + 1).
     margins = np.maximum(0.0, scores - correct_class_scores + delta)
 
-    # j == y_i인 정답 클래스 항은 수식에서 제외해야 합니다.
-    # 이 작업을 하지 않으면 정답 클래스도 항상 delta만큼 손실에 더해집니다.
+    # [7-3] 정답 클래스 자기 자신과 비교한 값은 제외!
+    #       제외하지 않으면 s_y-s_y+1 = 1이 불필요하게 더해진다.
     margins[np.arange(n), true_labels] = 0.0
 
+    # [7-4] 이미지별로 '정답 이외의 9개 클래스 손실'을 모두 더한다.
+    #       axis=1: 한 이미지(한 행)의 10개 열을 합산 → (N,) 벡터.
     losses_per_image = margins.sum(axis=1)
+
+    # [7-5] 위에서 구한 이미지 N장의 손실을 평균 낸다.
+    #       선택된 10장에서 관찰된 값: 평균 8.909212.
     average_loss = float(np.mean(losses_per_image))
     return losses_per_image, average_loss
 
 
 def compute_softmax(scores: np.ndarray) -> np.ndarray:
-    """점수(score)를 0~1 범위의 Softmax 확률로 변환합니다.
+    """[8단계] SVM Loss가 아니라 '원본 10개 점수'를 Softmax에 넣는다.
 
-    수식: P(class=j | image=i) = exp(s_ij) / sum_k exp(s_ik)
+    수식: P_ij = exp(s_ij) / Σ_k exp(s_ik)
+    입력 scores(N,10) → 출력 probabilities(N,10)
+    이미지마다 10개 값이 모두 0~1이고 그 합은 1이 된다.
 
-    구현 방법:
-        1) 각 행의 최대 점수를 빼줍니다.
-        2) 지수함수 exp()를 적용합니다.
-        3) 이미지별 지수 합계로 나눕니다.
-
-    max를 빼는 이유:
-        매우 큰 수의 exp 계산에서 overflow가 발생할 수 있기 때문입니다.
-        모든 점수에 같은 값을 빼도 Softmax 확률은 바뀌지 않습니다.
-
-    참고: 무작위 가중치의 Softmax 출력은 수학적으로 정규화된 값이지,
-    학습된 모델처럼 신뢰할 수 있는 실제 정답 확률은 아닙니다.
+    중요한 점: SVM Loss와 Softmax는 각각 '같은 원본 scores'에서 갈라진다.
+    Softmax는 W를 학습하지 않으며, 점수의 순위(argmax)를 바꾸지 않는다.
     """
     if scores.ndim != 2 or scores.shape[1] != NUM_CLASSES:
         raise ValueError("scores는 (N, 10) 형태여야 합니다.")
 
+    # [8-1] 이미지(행)마다 10개 점수 중 가장 큰 점수를 찾은 뒤 전부에서 뺀다.
+    #       예: 최대 0.867669이면 모든 점수에서 0.867669를 뺀다.
+    #       exp(큰 양수)의 overflow 방지용으로, 최종 확률은 달라지지 않는다.
+    #       keepdims=True → 최대 점수 결과 (N,1), 이미지별로 뺄 수 있음.
     shifted_scores = scores - np.max(scores, axis=1, keepdims=True)
+
+    # [8-2] 각 클래스 점수에 e^점수를 적용한다 → 10개 값 모두 양수.
     exp_scores = np.exp(shifted_scores)
+
+    # [8-3] 각 이미지의 10개 e^점수를 합하고, 개별 값을 이 합으로 나눈다.
+    #       예: probabilities[0,5]는 첫 번째 이미지의 dog Softmax 값.
+    #       각 이미지의 10개 값을 합하면 1이 된다.
     probabilities = exp_scores / np.sum(exp_scores, axis=1, keepdims=True)
     return probabilities
 
 
 def verify_probabilities(probabilities: np.ndarray) -> tuple[np.ndarray, bool]:
-    """각 이미지의 Softmax 확률 10개를 합쳐 1인지 검사합니다.
-
-    실수의 부동소수점 오차 때문에 sum == 1 대신 np.allclose()를 씁니다.
-    """
+    """[9단계] N장 각각의 클래스 확률 10개를 합하여 1인지 확인한다."""
+    # axis=1: 이미지별로 클래스 10개를 합산 → N개 합계가 나온다.
     sums = probabilities.sum(axis=1)
-    return sums, bool(np.allclose(sums, 1.0, rtol=1e-10, atol=1e-10))
+
+    # 컴퓨터의 실수 계산에는 작은 오차가 있으므로 == 1이 아닌 allclose 사용.
+    all_valid = bool(np.allclose(sums, 1.0, rtol=1e-10, atol=1e-10))
+    return sums, all_valid
 
 
 # -----------------------------------------------------------------------------
@@ -341,19 +524,26 @@ def find_correct_incorrect_examples(
     b: np.ndarray,
     search_size: int = 1000,
 ) -> dict[str, dict | None]:
-    """test_batch의 앞부분에서 맞은 사례와 틀린 사례를 각각 한 장 찾습니다.
+    """[10단계] 같은 W를 적용해 정답 1장과 오답 1장을 찾아 비교한다.
 
-    선택한 10장의 예시에서 우연히 맞은 결과가 없을 수도 있으므로,
-    별도의 고정된 탐색 범위(기본 1000장)에서 맞은/틀린 예를 확인합니다.
-
-    모델의 가중치는 바꾸지 않고, 정답 확인에만 실제 라벨을 사용합니다.
-    탐색 과정은 학습도 최적화도 아닙니다.
+    앞서 선택한 10장에 정답이 반드시 있을지는 알 수 없다. 그래서 별도로
+    test_batch의 '앞에서부터 최대 1000장'을 살펴본다(랜덤 재선택 아님).
+    이 과정은 비교를 위한 사례 탐색이며 모델 학습은 아니다.
     """
     count = min(max(1, search_size), len(all_images))
-    X = preprocess_images(all_images[:count])
-    predictions = predict_classes(compute_scores(X, W, b))
-    matches = predictions == all_labels[:count]
 
+    # [10-1] 별도의 1000장을 255로 나눠 X_search(1000,3072)를 만든다.
+    X_search = preprocess_images(all_images[:count])
+
+    # [10-2] 앞에서 초기화한 '동일한 W,b'로 1000장의 점수와 예측값을 계산한다.
+    #        정답 예시를 고른다고 W를 학습하거나 변경하는 것은 아니다.
+    search_scores = compute_scores(X_search, W, b)
+    search_predictions = predict_classes(search_scores)
+
+    # [10-3] 각 이미지에서 예측 번호와 실제 라벨 번호가 같은지 확인한다.
+    matches = search_predictions == all_labels[:count]
+
+    # [10-4] 첫 번째 정답(True)과 첫 번째 오답(False)의 원본 인덱스 기록.
     cases: dict[str, dict | None] = {"correct": None, "incorrect": None}
     for case_name, match_value in (("correct", True), ("incorrect", False)):
         positions = np.flatnonzero(matches == match_value)
@@ -363,7 +553,7 @@ def find_correct_incorrect_examples(
                 "index": idx,
                 "image": all_images[idx],
                 "true_label": int(all_labels[idx]),
-                "predicted_label": int(predictions[idx]),
+                "predicted_label": int(search_predictions[idx]),
             }
     return cases
 
@@ -423,21 +613,32 @@ def visualize_correct_incorrect(cases: dict[str, dict | None], output_path: Path
 
 
 def visualize_weights(W: np.ndarray, output_path: Path) -> None:
-    """10개 클래스의 가중치 벡터(3072)를 32x32x3 RGB 이미지로 보여줍니다.
+    """[11단계] '클래스별 가중치 3072개'를 RGB 이미지처럼 배열하여 관찰한다.
 
-    음수/양수 가중치는 원래 0~1 픽셀이 아니므로 시각화용으로 변환합니다.
-    변환: 0 중심, +-3*표준편차가 대략 0~1에 대응하도록 조정.
-
-    이 함수의 변환은 *그림을 보기 위한 것*이며 실제 W 값은 바뀌지 않습니다.
+    여기서 시각화하는 것은 입력 이미지 x가 아니라 W의 각 행이다.
+      W[0] (3072,) → airplane에 대응하는 가중치의 RGB 패턴
+      W[3] (3072,) → cat에 대응하는 가중치의 RGB 패턴
+    학습하지 않았으므로 실제 비행기/고양이 형상이 아닌 잡음처럼 보인다.
     """
     fig, axes = plt.subplots(2, 5, figsize=(13, 6))
+
+    # [11-1] W에는 음수도 있으므로 이미지로 표시할 때만 0~1로 변환할 기준을 구한다.
+    #        W 원본의 값 자체는 전혀 수정하지 않는다.
     visual_scale = 3.0 * float(np.std(W))
+
     for class_id, ax in enumerate(axes.flat):
+        # [11-2] W[class_id] 3072개를 (32,32,3) RGB 순서로 재배치한다.
         weight_image = flat_to_rgb_image(W[class_id])
+
+        # [11-3] 화면 표시 전용: 0에 가까운 가중치→회색(0.5),
+        #        양수→밝게, 음수→어둡게 나타나도록 정규화/클리핑한다.
         display_image = np.clip(weight_image / (2 * visual_scale) + 0.5, 0.0, 1.0)
+
+        # [11-4] class_id에 해당하는 이름과 RGB 가중치 패턴을 그린다.
         ax.imshow(display_image)
         ax.set_title(CLASS_NAMES[class_id])
         ax.axis("off")
+
     fig.suptitle("Random weight templates: noise, not learned class features")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -723,103 +924,6 @@ def run_formula_self_test() -> str:
 # -----------------------------------------------------------------------------
 # 8. 전체 실행을 관리하는 main 함수
 # -----------------------------------------------------------------------------
-def main() -> None:
-    """실행 옵션을 읽고, 1~7단계를 순서대로 호출합니다."""
-    parser = argparse.ArgumentParser(description="CIFAR-10 Linear Classification (no training)")
-    parser.add_argument(
-        "--data", type=Path, default=Path("cifar-10-python.tar.gz"),
-        help="CIFAR-10 Python tar.gz 파일 또는 압축 해제된 폴더 경로",
-    )
-    parser.add_argument(
-        "--download", action="store_true", help="데이터가 없다면 공식 사이트에서 다운로드",
-    )
-    parser.add_argument(
-        "--num-examples", type=int, default=10,
-        help="점수/확률/Loss를 계산할 예시 이미지 수 (기본: 10)",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="재현용 난수 시드 (기본: 42)")
-    parser.add_argument("--weight-std", type=float, default=0.01, help="무작위 가중치 표준편차")
-    parser.add_argument("--search-size", type=int, default=1000, help="맞은/틀린 예시 탐색 범위")
-    parser.add_argument("--output-dir", type=Path, default=Path("results"), help="결과 저장 폴더")
-    parser.add_argument("--self-test", action="store_true", help="PPT 수식만 검증 (데이터 필요 없음)")
-    args = parser.parse_args()
-
-    if args.self_test:
-        print(run_formula_self_test())
-        return
-
-    # 1) 데이터셋을 불러옵니다. 필요한 경우에만 명시적으로 다운로드합니다.
-    if args.download and not args.data.exists():
-        if args.data.suffixes[-2:] != [".tar", ".gz"]:
-            parser.error("--download 사용 시 --data에는 .tar.gz 파일 경로를 지정해 주세요.")
-        download_cifar10(args.data)
-    raw_images, labels = load_cifar10(args.data)
-    print(f"[1] 데이터 로딩 완료: images={raw_images.shape}, labels={labels.shape}")
-
-    # 2) 고정 시드로 이미지 예시를 선정합니다.
-    selected_images, selected_labels, selected_indices = select_examples(
-        raw_images, labels, args.num_examples, args.seed
-    )
-    X = preprocess_images(selected_images)
-    print(f"[2] 예시 {len(X)}장, 정규화된 입력 X={X.shape}")
-
-    # 3) 훈련하지 않은 무작위 파라미터로 점수를 계산합니다.
-    W, b = initialize_parameters(args.seed, args.weight_std)
-    scores = compute_scores(X, W, b)
-    predictions = predict_classes(scores)
-    print(f"[3] 가중치 W={W.shape}, 편향 b={b.shape}, 점수={scores.shape}")
-
-    # 4) 정답을 이용해 SVM Hinge Loss만 계산합니다. W를 갱신하지 않습니다.
-    losses_per_image, average_loss = compute_svm_loss(scores, selected_labels)
-    print(f"[4] Multiclass SVM 평균 Hinge Loss: {average_loss:.6f}")
-
-    # 5) 원본 점수를 Softmax 확률로 바꾸고 합이 1인지 확인합니다.
-    probabilities = compute_softmax(scores)
-    probability_sums, probability_valid = verify_probabilities(probabilities)
-    if not probability_valid:
-        raise AssertionError("Softmax 확률 합이 1이 아닙니다. 코드를 확인해 주세요.")
-    if not np.array_equal(predictions, predict_classes(probabilities)):
-        raise AssertionError("Softmax 처리로 예측 클래스가 달라졌습니다.")
-    print(f"[5] Softmax 확률 합 검사: {probability_valid}")
-
-    # 6) 별도 샘플 중 정답/오답 사례를 찾습니다(확률 높은 예시를 골라서 학습하지 않음).
-    cases = find_correct_incorrect_examples(raw_images, labels, W, b, args.search_size)
-    print("[6] 정답 및 오답 사례 탐색 완료")
-
-    # 7) 모든 결과를 제출용 파일로 저장합니다.
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    save_score_results(
-        selected_indices, selected_labels, predictions, scores, probabilities,
-        args.output_dir / "score_probabilities.csv",
-    )
-    save_loss_results(
-        selected_indices, selected_labels, predictions, losses_per_image,
-        probability_sums, args.output_dir / "svm_loss_and_probability_sums.csv",
-    )
-    visualize_predictions(
-        selected_images, selected_labels, predictions, selected_indices,
-        args.output_dir / "selected_examples.png",
-    )
-    visualize_correct_incorrect(cases, args.output_dir / "correct_incorrect.png")
-    visualize_weights(W, args.output_dir / "random_weights.png")
-    visualize_score_softmax_comparison(
-        scores[0], probabilities[0], args.output_dir / "score_vs_softmax.png",
-    )
-    save_explanations(
-        args.output_dir / "brief_explanations_ko.md",
-        args.seed, args.weight_std, selected_indices, selected_labels, predictions,
-        scores, probabilities, losses_per_image, average_loss,
-        probability_sums, probability_valid, cases,
-    )
-    print_detailed_scores(
-        selected_indices, selected_labels, predictions, scores, probabilities,
-        losses_per_image, probability_sums,
-    )
-    print("\n" + "=" * 72)
-    print(f"평균 SVM Hinge Loss: {average_loss:.6f}")
-    print("Softmax 확률 합 모두 1:", probability_valid)
-    print(f"[7] 제출용 파일 저장 완료: {args.output_dir.resolve()}")
-    print("※ 학습/정확도/정밀도/재현율/F1 계산은 수행하지 않았습니다.")
 
 
 if __name__ == "__main__":
